@@ -9,6 +9,7 @@ using: UNet
 import os
 import sys
 import time
+import pickle
 import multiprocessing
 from collections import defaultdict
 import argparse
@@ -33,7 +34,7 @@ def get_args():
     parser.add_argument('-d', '--debug', action='store_true', help='If set, then use debugging mode - dataset consists of a small number of points')
 
     # Output
-    parser.add_argument("--base_output", dest="base_output", default="./output/", help="Directory which will have folders per run")  # noqa
+    parser.add_argument("--base_output", dest="base_output", default="./output/seg", help="Directory which will have folders per run")  # noqa
     parser.add_argument("-r", "--run", dest='run_code', type=str, default='', help='Name this run. It will be part of file names for convenience')  # noqa
     parser.add_argument('--eval_every', dest='eval_every', default=1, help='How often to evaluate model')
     parser.add_argument('--save_every', dest='save_every', default=1, help='How often to save model')
@@ -71,7 +72,7 @@ def get_args():
     return args
 
 
-replace_metric_by_mean = ['loss', 'cm', 'accuracy', 'precision', 'recall', 'f1']
+replace_metric_by_mean = ['loss', 'accuracy', 'precision', 'recall', 'f1']
 
 
 def get_metrics(seg, seg_hat):
@@ -114,7 +115,7 @@ def test(args, model, loader, prefix='', verbose=True):
 
 
 def train_unet_v0(args, dataset, train_loader, test_loader):
-    output_dir = os.path.join(args.base_output, args.run_code)
+    output_dir = args.base_output
     model = unet.UNet128()
     if args.cuda:
         model = model.cuda()
@@ -151,20 +152,22 @@ def train_unet_v0(args, dataset, train_loader, test_loader):
             metrics[k].append(np.mean(v))
 
         print('#### [{:.2f}] Epoch {} ####'.format(time.time() - tic, epoch_idx))
-        for k, v in metrics.items():
-            print('#### {}: {:.3f}'.format(k, v[epoch_idx]))
+        for k, v in epoch_metrics.items():
+            print('#### {}: {:.3f}'.format(k, v[-1]))
         print('#####################')
 
         # Eval and save if necessary.
         if general_utils.periodic_integer_delta(epoch_idx, args.eval_every):
+            model = model.eval()
             test_metrics = test(args, model, test_loader, prefix='Test Dataset, Epoch {}'.format(epoch_idx))
+            model = model.train()
             for k, v in test_metrics.items():
                 metrics['test_{}_epoch{}'.format(k, epoch_idx)] = v
 
         if general_utils.periodic_integer_delta(epoch_idx, args.save_every):
             checkpoint_path = os.path.join(output_dir, "last.checkpoint")
             print('Saving model to {}'.format(checkpoint_path))
-            chk = general_utils.make_checkpoint(model, optimizer, epoch)
+            chk = general_utils.make_checkpoint(model, optimizer, epoch_idx)
             torch.save(chk, checkpoint_path)
     return model, metrics
 
@@ -196,5 +199,5 @@ if __name__ == '__main__':
     args = get_args()
     general_utils.dump_everything(args)
     model, metrics = run_v0(args)
-    with open(os.path.join(args.base_output, args.run_code, "metrics.pkl"), "wb") as f:
+    with open(os.path.join(args.base_output, "metrics.pkl"), "wb") as f:
         pickle.dump(metrics, f)

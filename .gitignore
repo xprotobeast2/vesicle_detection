@@ -2,6 +2,7 @@
 data/*
 !data/*.py
 rs.sh
+PyTorch-YOLOv3/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
