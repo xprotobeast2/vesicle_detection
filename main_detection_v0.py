@@ -83,7 +83,7 @@ def get_args():
 replace_metric_by_mean = ['loss', 'AP[1]', 'mAP']
 
 
-def get_metrics(det, det_hat, min_label=1, iou_thres=0.8):
+def get_metrics(det, det_hat, min_label=1, iou_thres=0.4):
     pred_boxes, pred_cls = det_hat
     metrics = {}
     pred_boxes, pred_cls = det_hat
@@ -189,7 +189,7 @@ def test(args, model, loader, prefix='', verbose=True):
             loss, loss_dict = loss_fn(det_hat[0], det_hat[1], det)
             metrics['loss'].append(loss.item())
             for k, v in loss_dict.items():
-                metrics[k].append(v)
+                metrics[k].append(np.mean([v]))
             for k, v in get_metrics(det, det_hat).items():
                 metrics[k].append(v)
 
@@ -240,7 +240,7 @@ def train_detector_v0(args, dataset, train_loader, test_loader):
 
             epoch_metrics['loss'].append(loss.item())
             for k, v in loss_dict.items():
-                epoch_metrics[k].append(v)
+                epoch_metrics[k].append(np.mean([v]))
             for k, v in get_metrics(det, det_hat).items():
                 epoch_metrics[k].append(v)
 
