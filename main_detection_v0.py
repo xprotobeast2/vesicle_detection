@@ -18,6 +18,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch import optim
+from tqdm import tqdm
 from utils import (
     dataset as custom_dataset,
     general as general_utils,
@@ -27,13 +28,14 @@ from modules import (
     loss_fns,
 )
 import sklearn.metrics
-from utils.utils import bbox_iou_numpy, compute_ap
+from utils.bbox_utils import bbox_iou_numpy, compute_ap
 
 
 def get_args():
     parser = argparse.ArgumentParser()
     # Data
-    parser.add_argument('data_path', help='Path to dataset of ordered vertices and adjacencies')
+    parser.add_argument('--data_path', help='Path to dataset of ordered vertices and adjacencies')
+    parser.add_argument('-ld', '--load_data', action='store_true', help='If set, then create dataset from image list')
     parser.add_argument('-t', '--test_frac', default=0.3, help='Fraction of data to use for testing')
     parser.add_argument('-d', '--debug', action='store_true', help='If set, then use debugging mode - dataset consists of a small number of points')
 
@@ -45,7 +47,7 @@ def get_args():
 
     # Pretrained model.
     parser.add_argument('--config_path', type=str, default='yolov3/config/yolov3.cfg', help='Path to YOLO config file')
-    parser.add_argument('--weights_path', type=str, default='yolov3/weights/yolov3.weights', help='Path to YOLO weights file')
+    parser.add_argument('--weights_path', type=str, default=None, help='Path to YOLO weights file')
 
     # Hyperparameters
     parser.add_argument("--seed", dest="seed", type=int, metavar='<int>', default=1337, help="Random seed (default=1337)")  # noqa
@@ -60,7 +62,7 @@ def get_args():
 
     args = parser.parse_args()
 
-    args.num_workers = multiprocessing.cpu_count() // 3
+    args.num_workers = multiprocessing.cpu_count() // 4
     args.cuda = args.cuda and torch.cuda.is_available()
     args.device = 'cuda' if args.cuda else 'cpu'
     args.dataparallel = args.dataparallel and args.cuda
@@ -82,6 +84,22 @@ def get_args():
 
 replace_metric_by_mean = ['loss', 'AP[1]', 'mAP']
 
+
+def load_model(args, default_model=detector.Detector):
+    if args.model_path is None:
+        return default_model(
+                args.config_path,
+                dataset.window_size,
+                weights_path=args.weights_path,
+                n_classes=dataset.n_classes)
+    model_dict = torch.load(args.model_path)
+    model = default_model(
+                args.config_path,
+                dataset.window_size,
+                weights_path=args.weights_path,
+                n_classes=dataset.n_classes)
+    model.load_state_dict(model_dict["model"])
+    return model
 
 def get_metrics(det, det_hat, min_label=1, iou_thres=0.4):
     pred_boxes, pred_cls = det_hat
@@ -123,6 +141,7 @@ def get_metrics(det, det_hat, min_label=1, iou_thres=0.4):
 
             for label in range(n_classes):
                 truth_per_label[label] = np_truth_box[np_truth_cls == label]
+
         preds_per_idx.append(preds_per_label)
         truth_per_idx.append(truth_per_label)
 
@@ -178,10 +197,13 @@ def get_metrics(det, det_hat, min_label=1, iou_thres=0.4):
 
 
 def test(args, model, loader, prefix='', verbose=True):
+    
+    print("train: Beginning test")
+
     loss_fn = loss_fns.DetectorLossFn().to(args.device)
     metrics = defaultdict(list)
     with torch.no_grad():
-        for bidx, (img, det) in enumerate(loader):
+        for (img, det) in tqdm(loader):
             batch_size = img.shape[0]
             img = img.to(args.device).expand(batch_size, 3, *(img.shape[2:]))
             det = det.to(args.device)
@@ -201,18 +223,14 @@ def test(args, model, loader, prefix='', verbose=True):
             start_string = '#### {} evaluation ####'.format(prefix)
             print(start_string)
             for k, v in metrics.items():
-                print('#### {} = {}'.format(k, v))
+                print('#### {} = {}'.format(k, v[-1]))
             print(''.join(['#' for _ in range(len(start_string))]))
     return metrics
 
 
 def train_detector_v0(args, dataset, train_loader, test_loader):
     output_dir = args.base_output
-    model = detector.Detector(
-        args.config_path,
-        dataset.window_size,
-        weights_path=args.weights_path,
-        n_classes=dataset.n_classes)
+    model = load_model(args)
     if args.cuda:
         model = model.cuda()
     if args.dataparallel:
@@ -227,11 +245,14 @@ def train_detector_v0(args, dataset, train_loader, test_loader):
         weight_decay=args.weight_decay
     )
     metrics = defaultdict(list)
+    
+    print("train: Beginning train")
+
     for epoch_idx in range(args.epochs):
         print('Starting epoch {}'.format(epoch_idx))
         epoch_metrics = defaultdict(list)
         tic = time.time()
-        for bidx, (img, det) in enumerate(train_loader):
+        for (img, det) in tqdm(train_loader):
             batch_size = img.shape[0]
             img = img.to(args.device).expand(batch_size, 3, *(img.shape[2:]))
             det = det.to(args.device)
@@ -273,18 +294,29 @@ def train_detector_v0(args, dataset, train_loader, test_loader):
 
 
 def run_v0(args):
-    dataset = custom_dataset.VesicleDetectionDataset(args.data_path, load_from_pickle=False, cpu_count=args.num_workers)
+
+    print("main: Creating dataset")
+        
+    dataset = custom_dataset.VesicleDetectionDataset(args.data_path, load_from_pickle=(not args.load_data), cpu_count=args.num_workers)
+    if args.load_data:    
+        dataset.dump_to_pickle('data/vesicle_dataset.pkl')
     if args.debug:
         dataset.n = 50
 
     indices = np.random.permutation(list(range(len(dataset))))
     split_pos = int(args.test_frac * len(dataset))
+
+    print("main: Creating train loader")
+
     train_loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         sampler=torch.utils.data.SubsetRandomSampler(indices[split_pos:]),
     )
+
+    print("main: Creating test loader")
+
     test_loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,

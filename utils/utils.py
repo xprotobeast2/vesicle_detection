@@ -256,3 +256,19 @@ def build_targets(
 def to_categorical(y, num_classes):
     """ 1-hot encodes a tensor """
     return torch.from_numpy(np.eye(num_classes, dtype="uint8")[y])
+
+def one_hot_encode(labels, num_classes):
+    # One-hot encodes a 2d image
+    targets = torch.zeros((labels.shape[0],num_classes,)+labels.size()[-2:])
+    if len(labels.shape) < 4:
+        labels = labels[:,None,:,:]
+    targets[torch.where(labels==torch.arange(num_classes)[None,:,None,None])] = 1
+    return targets
+
+def argmax_to_categorical(preds):
+    target = torch.zeros(preds.shape)
+    max_indices = torch.argmax(preds, dim=1,keepdim=True).cpu()
+    target.scatter_(1, max_indices, 1)
+    return target
+
+

@@ -100,3 +100,29 @@ class DetectorLossFn(nn.Module):
             + conf_weight * loss_conf
         )
         return loss, loss_dict
+
+
+class DiceLoss(nn.Module):
+    def __init__(self, class_weights=None):
+        super(DiceLoss, self).__init__()
+        self.w = class_weights
+
+    def forward(self, preds, targets):
+        intersection = torch.einsum('bcij, bcij -> bc', [preds, targets])
+        union = torch.einsum('bcij, bcij -> bc', [preds, preds]) + \
+                torch.einsum('bcij, bcij -> bc', [targets, targets])
+
+        iou = torch.div(intersection, union)
+        dice = torch.div(2*intersection, union)
+
+        avg_dice = (torch.einsum('bc->c', dice) / (targets.shape[0]))
+                
+        if self.w is not None:    
+            avg_dice = torch.dot(self.w, avg_dice)/targets.shape[1]
+        else:
+            avg_dice = torch.einsum('c->', avg_dice)/targets.shape[1]
+
+        return (1 - avg_dice)
+
+
+

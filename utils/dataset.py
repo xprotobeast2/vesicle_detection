@@ -3,27 +3,30 @@ Implement datasets
 '''
 
 import os
+import sys
 import time
 import multiprocessing
 import pickle
+import h5py
 import numpy as np
 import pandas as pd
 import skimage
+import cv2
 from PIL import Image
 import torch
 from torch.utils.data.dataset import Dataset as TorchDataset
 from joblib import Parallel, delayed
+from tqdm import tqdm
+vesicle_codes = {'docked_DCV': 1, 'LV': 2, 'tethered_SV': 3, 'CCV': 4, 'docked_SV': 5, 'DCV': 6, 'SV': 7, 'Plasma_membrane': 8}  # noqa
 
 
-vesicle_codes = {'docked_DCV': 1, 'LV': 2, 'tethered_SV': 3, 'CCV': 4, 'docked_SV': 5, 'DCV': 6, 'SV': 7}  # noqa
-
-
-DTYPE = np.float32
-
+DTYPE = np.uint8
+IM_SHAPE = (1024,1024)
 
 def load_image(path):
     return np.array(Image.open(path)).astype(DTYPE)
 
+    
 
 def load_segmentation(path, shape=None):
     ''' If img is not None, fills up pixels with appropriate value
@@ -32,15 +35,24 @@ def load_segmentation(path, shape=None):
     if shape is not None:
         img = np.zeros(shape, dtype=np.float32)
         for i in range(df.shape[0]):
-            if df.iloc[i][1] in vesicle_codes:
+            if df.iloc[i][1] in vesicle_codes:  
+                val = vesicle_codes[df.iloc[i][1]]
                 if int(df.iloc[i][0]) == 1:
-                    val = vesicle_codes[df.iloc[i][1]]
-                    # x, y, r are not the same as r, c, radius...
-                    x, y, r = (float(df.iloc[i][2]), float(df.iloc[i][3]), float(df.iloc[i][4]) / 2)
-                    img[skimage.draw.circle(y, x, r, shape=img.shape)] = val
+                    if args.vesicle:
+                        # x, y, r are not the same as r, c, radius...
+                        x, y, r = (float(df.iloc[i][2]), float(df.iloc[i][3]), float(df.iloc[i][4])/2)
+                        img[skimage.draw.circle(y, x, r, shape=img.shape)] = val
                 else:
-                    # TODO handle straight line/free hand tool type things
-                    pass
+                    if args.membrane:
+                        # TODO handle straight line/free hand tool type things
+                        x = np.array(list(map(int, df.iloc[i][3].split(',')))).astype(int)
+                        y = np.array(list(map(int, df.iloc[i][4].split(',')))).astype(int)
+                        
+                        y[y>=img.shape[0]] = img.shape[0] - 1
+                        x[x>=img.shape[1]] = img.shape[1] - 1
+
+                        pts = np.vstack([x,y]).T.astype('int32')
+                        cv2.polylines(img, [pts], False, val, thickness=10)
             else:
                 pass  # other methods have not been implemented
 
@@ -49,22 +61,18 @@ def load_segmentation(path, shape=None):
     return df.loc[df[1].isin(vesicle_codes) & df[0].isin(['1'])], img
 
 
-def get_non_zero_indices(segs, min_frac):
-    idxs = []
-    for i in range(len(segs)):
-        inner_idx = np.where(np.reshape(segs[i] > 0, (segs[i].shape[0], -1)).sum(1) > (min_frac * np.prod(segs[i].shape)))
-        idxs.append((i, inner_idx))
-    return idxs
+def get_non_zero_indices(seg, min_frac):
+    return np.where(np.reshape(seg > 0, (seg.shape[0], -1)).sum(1) > (min_frac * np.prod(seg.shape[1:])))
 
 
 class PixelSegmentationDataset(TorchDataset):
-    def __init__(self, image_list, load_from_npz=None, window_size=128, step_size=64, pad_mode='symmetric', cpu_count=10, minimum_patch_density=0.0001, n_classes=2, max_size=-1):
+    def __init__(self, image_list, window_size=128, step_size=64, 
+        pad_mode='symmetric', cpu_count=10, minimum_patch_density=0.001, n_classes=2, 
+        max_size=-1, normalize=False, transform=None):
         '''
         image_list: Either a list of tuples of segmentation files, image files
             or a path to a pickle containing said list.
 
-        load_from_npz: None, False or True.
-            If None then set to True if image_list is string ending in .npz
         image_list:
             One of:
             1. list of (seg_file, image_file) tuples or path to pickled file containing list
@@ -78,24 +86,44 @@ class PixelSegmentationDataset(TorchDataset):
         self.step_size = step_size
         self.pad_mode = pad_mode
         self.n_classes = n_classes
-        if load_from_npz is None:
-            load_from_npz = isinstance(image_list, str) and image_list.endswith('.npz')
-        if not load_from_npz:
-            self.load_from_image_list(image_list, window_size=window_size, step_size=step_size, pad_mode=pad_mode, cpu_count=cpu_count, minimum_patch_density=minimum_patch_density, max_size=max_size)
-        else:
-            self.load_from_npz(image_list)
-        self.images /= 255
-        self.images = (self.images - self.images.mean(0)) / (self.images.std(0) + 1e-8)
+        self.normalize = normalize
+        self.transform = transform
+
+        # Load dataset from disk
+        if isinstance(image_list, str):
+            if image_list.endswith('.pkl'):
+                self.load_from_image_list(image_list, window_size=window_size, step_size=step_size, pad_mode=pad_mode, cpu_count=cpu_count, minimum_patch_density=minimum_patch_density, max_size=max_size)
+            elif image_list.endswith('.npz'):
+                self.load_from_npz(image_list)
+            else:
+                # Pass in a directory to store npys
+                self.load_from_npy(image_list)
+        
+        # Show class weights
+        print('Class weights: %s'%str(self.class_weights))
         print('Loaded data in {:.1f}s'.format(time.time() - tic))
 
     def load_from_npz(self, image_list):
-        npz = np.load(image_list)
+        npz = np.load(image_list, mmap_mode='r')
         self.images = npz['images']
         self.segs = npz['segs']
+        self.class_weights = npz['weights']
+        self.n = self.images.shape[0]
+
+    def dump_to_npy(self, npy_dir):
+        os.makedirs(npy_dir, exist_ok=True)
+        np.save(npy_dir+'/images.npy', self.images)
+        np.save(npy_dir+'/segs.npy', self.segs)
+        np.save(npy_dir+'/weights.npy', self.class_weights)
+
+    def load_from_npy(self, npy_dir):
+        self.images = np.load(npy_dir+'/images.npy', mmap_mode='r')
+        self.segs = np.load(npy_dir+'/segs.npy', mmap_mode='r')
+        self.class_weights = np.load(npy_dir+'/weights.npy')
         self.n = self.images.shape[0]
 
     def dump_to_npz(self, file):
-        np.savez_compressed(file, images=self.images, segs=self.segs)
+        np.savez_compressed(file, images=self.images, segs=self.segs, weights=self.class_weights)
 
     def load_from_image_list(self, image_list, window_size=128, step_size=64, pad_mode='symmetric', cpu_count=10, minimum_patch_density=0.0001, max_size=-1):
         if isinstance(image_list, str):
@@ -120,32 +148,73 @@ class PixelSegmentationDataset(TorchDataset):
         if max_size > 0:
             self.img_paths = self.img_paths[:max_size]
             self.seg_paths = self.seg_paths[:max_size]
-        # TODO Parallelize loading
+        
         tic = time.time()
-        self.images = [load_image(path) for path in self.img_paths]
-        print('[{:.2f}s] Loaded images'.format(time.time() - tic))
+        
+        if args.load_images:
+            print("========== Loading data... ==========")
 
-        def _load(a, b):
-            return load_segmentation(a, shape=b)[1]
 
-        self.segs = Parallel(n_jobs=cpu_count)(delayed(_load)(self.seg_paths[i], self.images[i].shape) for i in range(len(self.images)))
-        print('[{:.2f}s] Loaded segmentations'.format(time.time() - tic))
+            # TODO Parallelize loading
+            imgs_h5 = h5py.File('data/images.hdf5', mode='w')
+            segs_h5 = h5py.File('data/segmentations.hdf5', mode='w')
+            for i in tqdm(range(len(self.img_paths))):
+                img = load_image(self.img_paths[i])
+                seg = load_segmentation(self.seg_paths[i], img.shape)[1]
+                #img = Image.fromarray(curr_seg).resize(IM_SHAPE)
+                imgs_h5.create_dataset('%d'%i, data=img)
+                segs_h5.create_dataset('%d'%i, data=seg)   
+            print("Total Images: %d"%len(imgs_h5.keys()))
+            print("Total Segs: %d"%len(segs_h5.keys()))
+            
+            imgs_h5.close()
+            segs_h5.close()
 
-        # Process into images
-        self.images = [np.reshape(window_fn(pad_fn(img)), (-1, window_size, window_size)) for img in self.images]
-        print('[{:.2f}s] Windowed images'.format(time.time() - tic))
-        self.segs = [np.reshape(window_fn(pad_fn(seg)), (-1, window_size, window_size)) for seg in self.segs]
-        print('[{:.2f}s] Windowed segmentations'.format(time.time() - tic))
+            print('[{:.2f}s] Loaded images'.format(time.time() - tic))
 
-        acceptable_indices = get_non_zero_indices(self.segs, minimum_patch_density)
-        print('[{:.2f}] Found {} patches to use'.format(time.time() - tic, sum(len(idxs[0]) for _, idxs in acceptable_indices)))
-        for i, idxs in acceptable_indices:
-            self.images[i] = self.images[i][idxs]
-            self.segs[i] = self.segs[i][idxs]
-        print('[{:.2f}s] Filtered out unnecessary images'.format(time.time() - tic))
+        # # create hdf5 file in data folder
+        if args.filter_patches:
+            print("========== Windowing data... ==========")
+
+            # Process into images
+            imgs_h5 = h5py.File('data/images.hdf5', mode='r')
+            segs_h5 = h5py.File('data/segmentations.hdf5', mode='r')
+            windowed_imgs_h5 = h5py.File('data/windowed_images.hdf5', mode='w')
+            windowed_segs_h5 = h5py.File('data/windowed_segmentations.hdf5', mode='w')
+            for i in tqdm(range(len(self.img_paths))):
+                windowed_img = np.reshape(window_fn(pad_fn(imgs_h5.get('%d'%i))), (-1, window_size, window_size))            
+                windowed_seg = np.reshape(window_fn(pad_fn(segs_h5.get('%d'%i))), (-1, window_size, window_size))
+                idxs = get_non_zero_indices(windowed_seg, minimum_patch_density)
+                windowed_imgs_h5.create_dataset('%d'%i, data=windowed_img[idxs])   
+                windowed_segs_h5.create_dataset('%d'%i, data=windowed_seg[idxs])   
+            print("Total Processed Images: %d"%len(windowed_imgs_h5.keys()))
+            windowed_imgs_h5.close()
+            windowed_segs_h5.close()
+            imgs_h5.close()
+            segs_h5.close()
+
+        print("========== Concatenating data... ==========")
+
+        windowed_imgs_h5 = h5py.File('data/windowed_images.hdf5', mode='r')
+        windowed_segs_h5 = h5py.File('data/windowed_segmentations.hdf5', mode='r')
+        self.images = []
+        self.segs = []
+        for i in tqdm(range(len(self.img_paths))):
+            img = np.array(windowed_imgs_h5.get('%d'%i))
+            seg = np.array(windowed_segs_h5.get('%d'%i))
+            #print(i, img.shape, seg.shape)
+            self.images.append(img)
+            self.segs.append(seg)
+        windowed_imgs_h5.close()
+        windowed_segs_h5.close()
         self.images = np.concatenate(self.images)
+        self.images = self.images.astype(np.float32)/255
+        if self.normalize:
+            self.images = (self.images - self.images.mean(0)) / (self.images.std(0) + 1e-8)
         print('[{:.2f}s] Concatenated images'.format(time.time() - tic))
         self.segs = np.concatenate(self.segs)
+        uniques, counts = np.unique(self.segs, return_counts=True)
+        self.class_weights = (counts*1.0)/counts.sum()
         print('[{:.2f}s] Concatenated segs'.format(time.time() - tic))
         self.n = self.images.shape[0]
 
@@ -154,14 +223,17 @@ class PixelSegmentationDataset(TorchDataset):
 
     def __getitem__(self, idx):
         # TODO Data augmentation
-        return (
-            np.reshape(self.images[idx], (1, self.window_size, self.window_size)),
-            self.segs[idx].astype(np.int64)
-        )
-
+        img = np.array(self.images[idx])
+        seg = np.array(self.segs[idx])
+        if self.transform:
+            img = self.transform(Image.fromarray(np.reshape(img, (self.window_size, self.window_size))))
+            seg = self.transform(Image.fromarray(seg))
+        else:
+            img = np.reshape(img, (1, self.window_size, self.window_size))
+        return (img, seg)
 
 class VesicleDetectionDataset(TorchDataset):
-    def __init__(self, image_list, load_from_pickle=None, window_size=416, cpu_count=10, n_classes=1, max_objects=80, classify_vesicle_type=False):
+    def __init__(self, image_list, load_from_pickle=None, window_size=256, cpu_count=10, n_classes=1, max_objects=80, classify_vesicle_type=False):
         ''' Each datapoint is an (img, det) tuple where
             det is an array whose rows represent
             [nclass, top-left-x, top-left-y, bottom-right-x, bottom-right-y]
@@ -194,7 +266,7 @@ class VesicleDetectionDataset(TorchDataset):
             pickle.dump({
                 'images': self.images,
                 'dets': self.dets,
-            })
+            }, f, protocol=4)
 
     def load_from_image_list(self, image_list, window_size=416, cpu_count=10):
         if isinstance(image_list, str):
@@ -222,7 +294,7 @@ class VesicleDetectionDataset(TorchDataset):
                         det_windows.append(
                             np.array([
                                 vesicle_codes[detections.iloc[i][1]] if self.classify_vesicle_type else 0,
-                                x - r, y - r, x + r, y + r
+                                x - 2*r, y - 2*r, x + 2*r, y + 2*r
                             ]))
                     return window.astype(np.float32), np.stack(det_windows).astype(np.float32)
                 else:
@@ -232,7 +304,10 @@ class VesicleDetectionDataset(TorchDataset):
         images = []
         dets = []
 
-        for seg_path, img_path in image_list:
+        for i in tqdm(range(len(image_list))):
+
+            seg_path, img_path = image_list[i]
+            
             # Load image and segmentation
             full_img = load_image(img_path)
             df, _ = load_segmentation(seg_path, shape=None)  # Only need dataframe
@@ -269,19 +344,36 @@ class VesicleDetectionDataset(TorchDataset):
 
 
 if __name__ == '__main__':
-    with open('/data/cellseg/data/image_list.pkl', 'rb') as f:
-        imagelist = pickle.load(f)
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-i', '--input_file', default='data/image_list.pkl', help='Location of image list pickle')
+    parser.add_argument('-o', '--output_file', default='/data/cellseg/data/all_data.npz', help='Location to dump dataset')
+    parser.add_argument('-p', '--window_size', type=int, default=128, help='Window size for dataset')
+    parser.add_argument('-s', '--step_size', type=int, default=64, help='Step size for windows')
+    parser.add_argument('-d', '--patch_density', type=float, default=0.0, help='Ignores patches that have less than this percentage of foreground class')
+    parser.add_argument('-l', '--load_images', action='store_true', help='Do we need to reload images and segmentations')
+    parser.add_argument('-f', '--filter_patches', action='store_true', help='Do we need to refilter and window images')
+    parser.add_argument('-z', '--save_compressed', action='store_true', help='Dump dataset to npz')
+    parser.add_argument('-y', '--save_array', action='store_true', help='Dump dataset to npy directory')
+    parser.add_argument('--vesicle', action='store_true', help='Include vesicle class')
+    parser.add_argument('--membrane', action='store_true', help='Include membrane class')
+    parser.add_argument('--normalize', action='store_true', help='Center dataset to 0 and scale dataset to 1')
+
+
+    
+    args = parser.parse_args()
+
     import time; tic = time.time()
-    dataset = PixelSegmentationDataset(imagelist, cpu_count=multiprocessing.cpu_count() // 3)
+    dataset = PixelSegmentationDataset(args.input_file, cpu_count=multiprocessing.cpu_count() // 3, window_size=args.window_size, step_size=args.step_size, minimum_patch_density=args.patch_density, normalize=args.normalize)
     print('Loading took {}s'.format(time.time() - tic))
 
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-o', '--output_file', default='/data/cellseg/data/all_data.npz', help='Location to dump dataset')
-    args = parser.parse_args()
     tic = time.time()
-    dataset.dump_to_npz(args.output_file)
+    if args.save_compressed:    
+        dataset.dump_to_npz(args.output_file)
+    elif args.save_array:
+        dataset.dump_to_npy(args.output_file)
     print('Dumping images took {}s'.format(time.time() - tic))
     tic = time.time()
-    dataset = PixelSegmentationDataset(args.output_file, load_from_npz=True)
+    dataset = PixelSegmentationDataset(args.output_file)
     print('Loading from npz took {}s'.format(time.time() - tic))
