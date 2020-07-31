@@ -258,6 +258,17 @@ def to_categorical(y, num_classes):
     return torch.from_numpy(np.eye(num_classes, dtype="uint8")[y])
 
 def one_hot_encode(labels, num_classes):
+    """
+    Takes a (N,H,W) shaped segmentation map and converts it to a (N,C,H,W) one-hot encoded
+    segmentation map that can be compared with the model output for each batch of training.
+
+    params: labels is the ground truth segmentation map usually shaped (batch size, height, width)
+            with values from 1 to the total number of classes. num_classes is the number of types of 
+            structures being identified for this training run (including background).
+
+    return: one-hot encoded version shaped (batch_size, num_classes, height, width) of ground-truth labels
+    """
+
     # One-hot encodes a 2d image
     targets = torch.zeros((labels.shape[0],num_classes,)+labels.size()[-2:])
     if len(labels.shape) < 4:
@@ -266,9 +277,42 @@ def one_hot_encode(labels, num_classes):
     return targets
 
 def argmax_to_categorical(preds):
+    """
+    Takes a (N,C,H,W) shaped real-valued prediction from the model and converts 
+    it into a one-hot (N,C,H,W) shaped prediction, which can be compared with the
+    one-hot encoded segmentation map during testing. 
+
+    params: preds is the output from the model. Usually shaped (batch size, classes, height, width)
+
+    return: one-hot encoded version of model output, obtained by taking argmax and then scattering
+    """
+
     target = torch.zeros(preds.shape)
     max_indices = torch.argmax(preds, dim=1,keepdim=True).cpu()
     target.scatter_(1, max_indices, 1)
     return target
+
+def map_segmentation(seg, n_classes=2):
+    
+    """
+    For current usage, depending on whether only vesicles, or vesicles+membranes, 
+    or types of vesicles + membranes are being identified, the segmentation map will 
+    need to be constructed differenty.
+
+    params: seg is the ground truth segmentation map (1-8), n_classes is the 
+            number of classes being identified. 
+
+    return: the segmentation map with the correct classes (currently 0-2)
+    """
+
+    # Depending on how many classes are being used, we modify the segmentation differently
+    if n_classes > 2:
+        m1 = seg < 8
+        m2 = seg > 0
+        seg[m1 & m2] = 1
+        seg[seg == 8] = 2
+    elif n_classes == 2:
+        seg = (seg > 0)
+    return seg
 
 

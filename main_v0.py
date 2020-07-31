@@ -1,9 +1,17 @@
-'''
-Quick baseline
-for: Image segmentation (into vesicles)
-on: Sliding windows on original images
-using: UNet
-'''
+"""
+This is the main file for running a segmentation on the dataset. This file accepts 
+various arguments pertaining to the data, the output, hyperparameters etc.
+
+The training and testing loops are defined in this file, as well some evaluation metrics. 
+
+Example run of this file would be:
+
+python main_v0.py --cuda -dp --loss_func=dice -p 256 -s 128 -b 16 -e 50 -r eg_model_name -ud 4 -nc 3 --data_path=eg_dataset
+
+The above trains a 3-class segmentation model on the dataset with patch size 256 and overlap 128 with a 
+UNet type model with depth 4. The training is done for 50 epochs with batch size 16 with soft dice as 
+the loss function. If a gpu is available it will be used, and the model dataloading will use DataParallel. 
+"""
 
 
 import os
@@ -59,6 +67,7 @@ def get_args():
     # Optimization
     parser.add_argument("--loss_func", choices=['dice', 'crossentropy'], default='dice', help='Choose the loss function')  # noqa
     parser.add_argument("-cw", "--class_weights", action='store_true', help='Whether the loss should be weighted by class proportion' )
+    
     # Hardware
     parser.add_argument('--cuda', action='store_true', help='Use GPU if available or not')
     parser.add_argument("-dp", "--dataparallel", dest="dataparallel", default=False, action="store_true")  # noqa
@@ -81,6 +90,7 @@ def get_args():
         args.run_code = 'run{}'.format(run_count)
     args.base_output = os.path.join(args.base_output, args.run_code)
     os.makedirs(args.base_output, exist_ok=True)
+    # directory for batch loss
     os.makedirs(args.base_output+'/losses', exist_ok=True)
     print("Using run_code: {}".format(args.run_code))
     return args
@@ -89,6 +99,16 @@ def get_args():
 replace_metric_by_mean = ['loss', 'dice']
 
 def load_model(args, default_model=unet.UNetAuto):
+    
+    """
+    Loads a pytorch model from disk. Currently supports
+    the unet model interface only (num classes, depth, feature scale)
+
+    params: args are run parameters, default_model is the model's class definition
+
+    return: the model with either default or trained parameters
+    """
+
     if args.model_path is None:
         return default_model(n_classes=args.num_classes, depth=args.unet_depth, feat_scale=args.feat_scale)
     model_dict = torch.load(args.model_path)
@@ -96,18 +116,17 @@ def load_model(args, default_model=unet.UNetAuto):
     model.load_state_dict(model_dict["model"])
     return model
 
-def map_segmentation(seg, n_classes=2):
-    # Depending on how many classes are being used, we modify the segmentation differently
-    if n_classes > 2:
-        m1 = seg < 8
-        m2 = seg > 0
-        seg[m1 & m2] = 1
-        seg[seg == 8] = 2
-    elif n_classes == 2:
-        seg = (seg > 0)
-    return seg
+
 
 def dice_score(preds, targets):
+    """
+    Function for computing the dice score between two 4-d tensors. 
+
+    params: seg is the ground-truth segmentation map, and seg_hat is the output of the model during 
+            training or testing
+
+    return: a dictionary of metric values
+    """
 
     intersection = torch.einsum('bcij, bcij -> bc', [preds, targets])
     union = torch.einsum('bcij, bcij -> bc', [preds, preds]) + \
@@ -117,28 +136,45 @@ def dice_score(preds, targets):
     dice = 2*iou
     
     avg_dice = (torch.einsum('bc->', dice) / (targets.shape[0]*targets.shape[1]))
+    
+    # For debugging 
     if torch.isnan(iou).sum():
         print(iou)
         print(torch.isnan(intersection).sum(),torch.isnan(union).sum())
+
     return avg_dice
 
 def get_metrics(seg, seg_hat):
+    """
+    Top level function to compute metrics on model predictions and ground-truth. 
+
+    params: seg is the ground-truth segmentation map, and seg_hat is the output of the model during 
+            training or testing
+
+    return: a dictionary of metric values
+    """
+
     metrics = {}
     with torch.no_grad():
         seg = seg.cpu()
         target = seg_utils.argmax_to_categorical(seg_hat).cpu()
         #seg_hat = seg_hat.view(-1).cpu().numpy()
-        # metrics['cm'] = np.array(sklearn.metrics.confusion_matrix(seg, seg_hat))
-        # metrics['accuracy'] = np.array(sklearn.metrics.accuracy_score(seg, target))
-        # metrics['precision'] = np.array(sklearn.metrics.precision_score(seg, target))
-        # metrics['recall'] = np.array(sklearn.metrics.recall_score(seg, target))
         metrics['dice'] = dice_score(seg, target)
-        # metrics['kappa'] = sklearn.metrics.cohen_kappa_score(seg, seg_hat)
     return metrics
 
 
 def test(args, model, loader, prefix='', verbose=True):
-    
+    """
+    This function does a single pass through the testing set
+    and evaluates the average dice_score, and average loss. 
+
+    params: args are the run parameters, model is the model being tested,
+            loader is the pytorch test loader, prefix is a name string,
+            verbose flag is for printing metrics 
+
+    return: dictionary of metric values 
+    """
+
     print("train: Beginning test")
 
     metrics = defaultdict(list)
@@ -146,7 +182,7 @@ def test(args, model, loader, prefix='', verbose=True):
     with torch.no_grad():
         for (img, seg) in t:
             img = img.to(args.device)
-            seg = map_segmentation(seg, args.num_classes).long()          
+            seg = seg_utils.map_segmentation(seg, args.num_classes).long()          
             seg_hot = seg_utils.one_hot_encode(seg, args.num_classes).to(args.device)    
             seg = seg.to(args.device)
 
@@ -182,6 +218,18 @@ def test(args, model, loader, prefix='', verbose=True):
 
 
 def train_unet_v0(args, dataset, train_loader, test_loader):
+    """
+    This function defines the model, optimizer and output directories. 
+    It performs training, and prints metrics every eval_every epochs. 
+    Most importantly, this function also saves the model every eval_every
+    epochs.
+
+    params: args are run parameters, dataset is a pytorch dataset of the images,
+            train_loader and test_loader are the pytorch dataloaders. 
+
+    return: model and metrics
+    """
+
     output_dir = args.base_output
     model = load_model(args, unet.FRUNetAuto)
     if args.cuda:
@@ -199,6 +247,7 @@ def train_unet_v0(args, dataset, train_loader, test_loader):
 
     print("Getting Class balances... ")
 
+    # For weighted version of loss functions
     class_weights = None
     if args.class_weights:
         class_weights = [dataset.class_weights[0], dataset.class_weights[1:8].sum()]
@@ -219,7 +268,7 @@ def train_unet_v0(args, dataset, train_loader, test_loader):
         t = tqdm(train_loader)
         for (img, seg) in t:
             img = img.to(args.device)
-            seg = map_segmentation(seg, args.num_classes).long()
+            seg = seg_utils.map_segmentation(seg, args.num_classes).long()
             seg_hot = seg_utils.one_hot_encode(seg, args.num_classes).to(args.device)
             seg = seg.to(args.device)
             
@@ -269,7 +318,16 @@ def train_unet_v0(args, dataset, train_loader, test_loader):
 
 
 def run_v0(args):
-    
+    """
+    This function loads the dataset, creates pytorch dataloaders, applies any transforms,
+    and calls the train function. 
+
+    args: the run parameters to the file. See get_args() for descriptions
+
+    return: model and metrics
+    """
+
+
     print("main: Creating dataset")
 
     seg_transforms = transforms.Compose([

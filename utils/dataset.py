@@ -17,6 +17,7 @@ import torch
 from torch.utils.data.dataset import Dataset as TorchDataset
 from joblib import Parallel, delayed
 from tqdm import tqdm
+
 vesicle_codes = {'docked_DCV': 1, 'LV': 2, 'tethered_SV': 3, 'CCV': 4, 'docked_SV': 5, 'DCV': 6, 'SV': 7, 'Plasma_membrane': 8}  # noqa
 
 
@@ -24,13 +25,52 @@ DTYPE = np.uint8
 IM_SHAPE = (1024,1024)
 
 def load_image(path):
+    """
+    Loads a single image from disk using PIL. 
+
+    params: path is the location of the image on disk
+
+    return: the image as a numpy array of type DTYPE. 
+    """
     return np.array(Image.open(path)).astype(DTYPE)
 
     
 
 def load_segmentation(path, shape=None):
-    ''' If img is not None, fills up pixels with appropriate value
-    '''
+    """
+    A very important function that constructs the segmentation map for 
+    and image in the dataset. In the dataset, look at the .txt files within
+    the analysis_files directory to understand how this function works. The 
+    final output of the entire system should be a .txt file similar to those. 
+
+    The text file is formatted as : 1st column (tab) 2nd column (tab) 3rd column (tab)
+    4th column (tab) 5th column (tab) 6th column. The description of each column is as follows:
+
+        1st: the tool_type used in imageJ / Fiji. 1 is straight line. 
+             3 is freehand selection.  7 is freehand line.
+
+        2nd: name of object such as plasma membrane, active zone, SV (synaptic vesicles), 
+             endosomes, LV (large vesicles), and DCV (dense core vesicles). 
+             For SV close to active sone, there are more categories: docked or tethered SV.
+
+        3rd: If the object is either plasma membrane or active zone, 
+             it reports perimeter or length. If the object is endosomes, 
+             it reports area. Otherwise, this is skipped.
+
+        4th : x-coordinates. For tool-type 3 and 7, there will be multiple x-coordinates, 
+                each will be separated by “,”. For tool-type 1, it will give a single point
+                from the center of the object (i.e. the center of a synaptic vesicle).
+
+        5th: y- coordinates.
+
+        6th: Only if tool type is 1. this is diameter.
+
+    params: path is the location of the image on disk, shape is the dimensions of
+            the segmentation map. 
+
+    return: the image as a numpy array of type DTYPE. 
+    """
+
     df = pd.read_csv(path, sep='\t', header=None)
     if shape is not None:
         img = np.zeros(shape, dtype=np.float32)
@@ -44,7 +84,8 @@ def load_segmentation(path, shape=None):
                         img[skimage.draw.circle(y, x, r, shape=img.shape)] = val
                 else:
                     if args.membrane:
-                        # TODO handle straight line/free hand tool type things
+                        
+                        # 
                         x = np.array(list(map(int, df.iloc[i][3].split(',')))).astype(int)
                         y = np.array(list(map(int, df.iloc[i][4].split(',')))).astype(int)
                         
@@ -62,6 +103,15 @@ def load_segmentation(path, shape=None):
 
 
 def get_non_zero_indices(seg, min_frac):
+    """
+    A helper function that allows filtering of patches that do not contain
+    important objects.
+
+    params: seg is a single segmentation map viewed as windows. min_frac allows
+            removal of all windows that aren't at least min_frac foreground class.
+
+    return: the indices of the patches that have at least min_frac foreground cells. 
+    """
     return np.where(np.reshape(seg > 0, (seg.shape[0], -1)).sum(1) > (min_frac * np.prod(seg.shape[1:])))
 
 
@@ -69,17 +119,29 @@ class PixelSegmentationDataset(TorchDataset):
     def __init__(self, image_list, window_size=128, step_size=64, 
         pad_mode='symmetric', cpu_count=10, minimum_patch_density=0.001, n_classes=2, 
         max_size=-1, normalize=False, transform=None):
-        '''
-        image_list: Either a list of tuples of segmentation files, image files
-            or a path to a pickle containing said list.
+        """
+        Create a pytorch dataset from the dataset of EM images of neuronal synapses.
+        This class can be invoked in 3 ways based on the image_list parameter.
 
-        image_list:
-            One of:
-            1. list of (seg_file, image_file) tuples or path to pickled file containing list
-            2. npz file that can be loaded using np.load
+        params: 
 
-        Other args: Useful only when loading from actual list of images or file (not NPZ)
-        '''
+            image_list: Can be a path to 1) a pickle file 2) a compressed numpy zip 
+                        (.npz) file containing images and segmentations 3) a directory 
+                        containing the images and segmentations as separate .npy files
+            window_size: The dimension of the square image patch that will be used to 
+                         train the model.
+            step_size: The overlap between adjacent patches or the step taken when viewing 
+                       an image as windows.
+            pad_mode: The padding mode used with skimage.view_as_windows
+            cpu_count: The number of cpus used during window construction
+            minimum_patch_density: the minimum amount of pixels in the patched segmentation
+                                   that need to be a foreground class in order to keep the 
+                                   patch for training/testing.
+            n_classes: the number of types of objects in the image to be identified.
+            max_size: A limit on the dataset size
+            normalize: Translate the dataset to 0 mean and unit standard deviation
+            transform: the pytorch transforms that need to be applied to the dataset. 
+        """    
         super().__init__()
         tic = time.time()
         self.window_size = window_size
@@ -104,6 +166,12 @@ class PixelSegmentationDataset(TorchDataset):
         print('Loaded data in {:.1f}s'.format(time.time() - tic))
 
     def load_from_npz(self, image_list):
+        """
+        Loads the dataset from disk when it is a numpy zipped file.
+        This function uses read-only memory mapping.
+
+        params: image_list is the path to the .npz file
+        """
         npz = np.load(image_list, mmap_mode='r')
         self.images = npz['images']
         self.segs = npz['segs']
@@ -111,18 +179,41 @@ class PixelSegmentationDataset(TorchDataset):
         self.n = self.images.shape[0]
 
     def dump_to_npy(self, npy_dir):
+        """
+        Saves the dataset to disk to a directory with 
+        the images and segs as .npy files.
+        This is the best method when the dataset is large.
+
+        params: npy_dir is the path to the dataset directory
+        """
         os.makedirs(npy_dir, exist_ok=True)
         np.save(npy_dir+'/images.npy', self.images)
         np.save(npy_dir+'/segs.npy', self.segs)
         np.save(npy_dir+'/weights.npy', self.class_weights)
 
     def load_from_npy(self, npy_dir):
+        """
+        Loads the dataset from disk from .npy files.
+        Only method that works on a low RAM machine 
+        for the whole datasets. This function uses read-only 
+        memory mapping.
+
+        params: npy_dir is the path to the dataset directory containing
+                images.npy,segs.npy and weights.npy
+        """
         self.images = np.load(npy_dir+'/images.npy', mmap_mode='r')
         self.segs = np.load(npy_dir+'/segs.npy', mmap_mode='r')
         self.class_weights = np.load(npy_dir+'/weights.npy')
         self.n = self.images.shape[0]
 
     def dump_to_npz(self, file):
+        """
+        Save the dataset as a compressed numpy zip file. This works
+        well when the dataset size is smaller.
+
+        params: npy_dir is the path to the dataset directory containing
+                images.npy,segs.npy and weights.npy
+        """
         np.savez_compressed(file, images=self.images, segs=self.segs, weights=self.class_weights)
 
     def load_from_image_list(self, image_list, window_size=128, step_size=64, pad_mode='symmetric', cpu_count=10, minimum_patch_density=0.0001, max_size=-1):
