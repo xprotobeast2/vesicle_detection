@@ -217,6 +217,27 @@ class PixelSegmentationDataset(TorchDataset):
         np.savez_compressed(file, images=self.images, segs=self.segs, weights=self.class_weights)
 
     def load_from_image_list(self, image_list, window_size=128, step_size=64, pad_mode='symmetric', cpu_count=10, minimum_patch_density=0.0001, max_size=-1):
+        """
+        An important function that is responsible for loading, filtering, windowing, 
+        and writing the file to memory.  
+
+        params: 
+
+            image_list: Can be a path to 1) a pickle file 2) a compressed numpy zip 
+                        (.npz) file containing images and segmentations 3) a directory 
+                        containing the images and segmentations as separate .npy files
+            window_size: The dimension of the square image patch that will be used to 
+                         train the model.
+            step_size: The overlap between adjacent patches or the step taken when viewing 
+                       an image as windows.
+            pad_mode: The padding mode used with skimage.view_as_windows
+            cpu_count: The number of cpus used during window construction
+            minimum_patch_density: the minimum amount of pixels in the patched segmentation
+                                   that need to be a foreground class in order to keep the 
+                                   patch for training/testing.
+            max_size: A limit on the dataset size
+        """
+
         if isinstance(image_list, str):
             with open(image_list, 'rb') as f:
                 image_list = pickle.load(f)
@@ -242,11 +263,13 @@ class PixelSegmentationDataset(TorchDataset):
         
         tic = time.time()
         
+        # The reason the following are within if conditions is because not all stages
+        # need to be performed each time this file is run. 
+
+        # If this flag is set, then images are loaded and h5py datasets are created on disk
         if args.load_images:
             print("========== Loading data... ==========")
 
-
-            # TODO Parallelize loading
             imgs_h5 = h5py.File('data/images.hdf5', mode='w')
             segs_h5 = h5py.File('data/segmentations.hdf5', mode='w')
             for i in tqdm(range(len(self.img_paths))):
@@ -263,7 +286,7 @@ class PixelSegmentationDataset(TorchDataset):
 
             print('[{:.2f}s] Loaded images'.format(time.time() - tic))
 
-        # # create hdf5 file in data folder
+        # If this flag is set, the windowing and filtering is done
         if args.filter_patches:
             print("========== Windowing data... ==========")
 
@@ -284,6 +307,7 @@ class PixelSegmentationDataset(TorchDataset):
             imgs_h5.close()
             segs_h5.close()
 
+        # The data is concatenated here and normalized
         print("========== Concatenating data... ==========")
 
         windowed_imgs_h5 = h5py.File('data/windowed_images.hdf5', mode='r')

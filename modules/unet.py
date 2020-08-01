@@ -47,8 +47,32 @@ class BottleneckBlock(nn.Module):
         return self.block(x)
 
 class UNetAuto(nn.Module):
+    """
+    A parametrized UNet Model.
+
+    """
     def __init__(self, in_channels=1, n_classes=2, depth=2, base_channels=16, 
         feat_scale=1, kernel_size=3, stride=1, padding=1):
+        """
+        Constructs the UNet with an encoding path, bottleneck, and decoding path.
+        we use Conv2D, MaxPool and MaxUnpool. (Perhaps transposed convolutions can be 
+        experimented with). Consult EncodeBlock, DecodeBlock, Bottleneck 
+    
+        params:
+
+            in_channels: the number of channels in the input image
+            n_classes: number of segmentation classes, also the number of channels in output layer
+            depth: the number of blocks in the encoding or decoding path
+            base_channels: The base number of feature maps after the input
+            feat_scale: The multiplier for the number of feature maps in each consecutive block
+            kernel_size: the width of the convolution kernel
+            stride: convolution stride
+            padding: convolution padding
+        
+        """
+
+
+
         super(UNetAuto, self).__init__()
         
         self.depth = depth
@@ -148,8 +172,34 @@ class FullResBlock(nn.Module):
         return self.block(x)
 
 class FRUNetAuto(nn.Module):
+    """
+    A parametrized Fully Residual UNet Model based on FusionNet 
+    https://arxiv.org/pdf/1612.05360.pdf
+    
+    """
+
+
     def __init__(self, in_channels=1, n_classes=2, depth=2, base_channels=32, 
         feat_scale=1, kernel_size=3, stride=1, padding=1):
+        """
+        Constructs a UNet composed of residual blocks and skip connections 
+        with an encoding path, bottleneck, and decoding path.
+        we use Conv2D, MaxPool and MaxUnpool. (Perhaps transposed convolutions can be 
+        experimented with). 
+
+        params:
+
+            in_channels: the number of channels in the input image
+            n_classes: number of segmentation classes, also the number of channels in output layer
+            depth: the number of blocks in the encoding or decoding path
+            base_channels: The base number of feature maps after the input
+            feat_scale: The multiplier for the number of feature maps in each consecutive block
+            kernel_size: the width of the convolution kernel
+            stride: convolution stride
+            padding: convolution padding
+
+        """
+
         super(FRUNetAuto, self).__init__()
         
         self.depth = depth

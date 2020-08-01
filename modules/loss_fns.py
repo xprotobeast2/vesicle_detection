@@ -103,11 +103,30 @@ class DetectorLossFn(nn.Module):
 
 
 class DiceLoss(nn.Module):
+    """
+    This is a custom loss function used for segmentation.
+    This is soft dice, a differentiable form of the dice (f1)
+    score, which is a more effective loss function to optimize
+    when there is a large class imbalance.
+
+    """
+
     def __init__(self, class_weights=None):
         super(DiceLoss, self).__init__()
         self.w = class_weights
 
     def forward(self, preds, targets):
+
+        """
+        We compute a mutual dot product across all values in the 2-D image,
+        then divide by the self dot product of the predictions and targets.
+        We average these values over batch and classes. 
+
+        params: preds are the real valued model predictions, targets is the 
+                ground-truth segmentation map.
+
+        return: the soft dice score
+        """
         intersection = torch.einsum('bcij, bcij -> bc', [preds, targets])
         union = torch.einsum('bcij, bcij -> bc', [preds, preds]) + \
                 torch.einsum('bcij, bcij -> bc', [targets, targets])
