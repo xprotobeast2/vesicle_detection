@@ -1,7 +1,6 @@
 # Automated Detection/Segmentation of Ultrastructure Features in Electron Microscope Images of Neuronal Synapses
 
 ## Requirements:
-- Anaconda
 - Python 3.5+
 - PyTorch (1.0)
 - PIL
